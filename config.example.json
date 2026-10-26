@@ -1,0 +1,20 @@
+{
+  "botName": "Nova",
+  "botNumber": "",
+  "ownerNumber": "",
+  "timezone": "Asia/Karachi",
+  "llm": {
+    "enabled": true,
+    "model": "openai/gpt-oss-120b",
+    "apiBase": "https://api.groq.com/openai/v1"
+  },
+  "meetup": {
+    "enabled": false,
+    "groupJid": "",
+    "askTime": "10:00",
+    "cutoffTime": "20:00"
+  },
+  "access": {
+    "groupJids": []
+  }
+}

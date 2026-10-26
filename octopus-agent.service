@@ -1,0 +1,19 @@
+[Unit]
+Description=Octopus Agent - WhatsApp assistant (Baileys)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust these two paths to where you cloned the repo.
+WorkingDirectory=/home/YOURUSER/octopus-agent-template
+ExecStart=/usr/bin/node src/index.js
+Restart=always
+RestartSec=5
+Environment=HOME=/home/YOURUSER
+# Only needed inside the Muse VM (routes through its egress proxy):
+# Environment=WA_USE_PROXY=1
+# Environment=WA_PROXY_URL=http://hatch-egress-proxy:3128
+
+[Install]
+WantedBy=multi-user.target

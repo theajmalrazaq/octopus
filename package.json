@@ -1,0 +1,20 @@
+{
+  "name": "octopus-agent-template",
+  "version": "1.0.0",
+  "description": "Self-hosted WhatsApp AI agent (Baileys + LLM tool-calling): reminders, a daily meetup flow, strict access control, and a personality you define.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "keywords": [],
+  "author": "theajmalrazaq",
+  "license": "MIT",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "https-proxy-agent": "^9.1.0",
+    "pino": "^10.4.0",
+    "qrcode": "^1.5.4",
+    "undici": "^8.12.3"
+  },
+  "type": "module"
+}
