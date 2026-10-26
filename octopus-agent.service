@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 # Adjust these two paths to where you cloned the repo.
 WorkingDirectory=/home/YOURUSER/octopus-agent-template
-ExecStart=/usr/bin/node src/index.js
+ExecStart=/usr/bin/node dist/index.js
 Restart=always
 RestartSec=5
 Environment=HOME=/home/YOURUSER

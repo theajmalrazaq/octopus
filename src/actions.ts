@@ -1,39 +1,35 @@
-// Reminder / meetup operations the AI can perform. These are the ONLY things
-// that touch the store on the conversation side — all decisions about when to
-// call them are made by the LLM, not by hardcoded parsing rules.
-import { pktEpoch, todayStr, TZ } from './time.js';
+// Reminder / meetup operations the AI can perform. These are the only things
+// that touch the database on the conversation side — every decision about
+// when to call them is made by the LLM, not by hardcoded parsing rules.
+import { tzEpoch, todayStr, tz } from './time.js';
+import {
+  addReminder, deleteReminder, getMeetupGroupJid, getMeetupState, listReminders,
+  setMeetupGroupJid, setMeetupState, setMeetupTimes, updateReminder,
+} from './db.js';
+import type { AgentConfig, MsgContext, Reminder } from './types.js';
 
-export function fmtWhen(ts) {
+export function fmtWhen(ts: number): string {
   return new Date(ts).toLocaleString('en-US', {
-    timeZone: TZ,
+    timeZone: tz(),
     weekday: 'short',
     hour: 'numeric',
     minute: '2-digit',
   });
 }
 
-// Reminder IDs are per-chat: each chat numbers its own reminders from 1.
-export function nextReminderId(store, jid) {
-  return Math.max(0, ...store.reminders.filter((r) => r.jid === jid).map((r) => r.id)) + 1;
-}
-
-export function chatReminders(store, jid) {
-  return store.reminders
-    .filter((r) => r.jid === jid)
-    .sort((a, b) => a.dueAt - b.dueAt);
-}
-
-export function describeReminders(store, jid) {
-  const mine = chatReminders(store, jid);
+export function describeReminders(jid: string): string {
+  const mine = listReminders(jid);
   if (!mine.length) return 'none';
-  return mine.map((r) => `#${r.id} "${r.text}" — ${fmtWhen(r.dueAt)}${r.repeat ? ` (repeats ${r.repeat})` : ''}`).join('; ');
+  return mine
+    .map((r: Reminder) => `#${r.seq} "${r.text}" — ${fmtWhen(r.dueAt)}${r.repeat ? ` (repeats ${r.repeat})` : ''}`)
+    .join('; ');
 }
 
-function parseWhen(when) {
-  // "YYYY-MM-DD HH:MM" (agent timezone)
+function parseWhen(when: unknown): number | null {
+  // "YYYY-MM-DD HH:MM" in the agent's timezone.
   const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{1,2}):(\d{2})/.exec(String(when || '').trim());
   if (!m) return null;
-  return pktEpoch(m[1], `${m[2]}:${m[3]}`);
+  return tzEpoch(m[1], `${m[2]}:${m[3]}`);
 }
 
 export const TOOLS = [
@@ -46,7 +42,7 @@ export const TOOLS = [
         type: 'object',
         properties: {
           text: { type: 'string', description: 'What the reminder is about, short.' },
-          when: { type: 'string', description: 'Date and time in Asia/Karachi, format "YYYY-MM-DD HH:MM" (24h). Resolve relative times like "tomorrow" or "in 30 minutes" yourself using the current time given to you.' },
+          when: { type: 'string', description: 'Date and time in the agent timezone, format "YYYY-MM-DD HH:MM" (24h). Resolve relative times like "tomorrow" or "in 30 minutes" yourself using the current time given to you.' },
           repeat: { type: 'string', enum: ['daily', 'weekly'], description: 'Optional. Only if they asked for a repeating reminder.' },
         },
         required: ['text', 'when'],
@@ -108,7 +104,7 @@ export const OWNER_TOOLS = [
     type: 'function',
     function: {
       name: 'setup_meetup_here',
-      description: 'Owner only: make THIS group the meetup group. Octopus will ask here daily at ask_time whether the group is meeting, and post a missed note after cutoff_time.',
+      description: 'Owner only: make THIS group the meetup group. The agent will ask here daily at ask_time whether the group is meeting, and post a missed note after cutoff_time.',
       parameters: {
         type: 'object',
         properties: {
@@ -121,59 +117,63 @@ export const OWNER_TOOLS = [
 ];
 
 // Execute one tool call. Returns a short JSON string for the model.
-export function applyTool(store, cfg, ctx, name, argsRaw) {
-  let args = {};
-  try { args = typeof argsRaw === 'string' ? JSON.parse(argsRaw || '{}') : (argsRaw || {}); } catch { /* empty */ }
+export function applyTool(cfg: AgentConfig, ctx: MsgContext, name: string, argsRaw: unknown): string {
+  let args: Record<string, unknown> = {};
+  try {
+    args = (typeof argsRaw === 'string' ? JSON.parse(argsRaw || '{}') : argsRaw || {}) as Record<string, unknown>;
+  } catch { /* empty */ }
   const jid = ctx.jid;
-  const fail = (error) => JSON.stringify({ ok: false, error });
+  const fail = (error: string) => JSON.stringify({ ok: false, error });
 
   switch (name) {
     case 'set_reminder': {
       const dueAt = parseWhen(args.when);
       if (dueAt === null) return fail('bad "when" format — use "YYYY-MM-DD HH:MM" (24h, agent timezone)');
       if (!args.text) return fail('missing reminder text');
-      const id = nextReminderId(store, jid);
-      store.reminders.push({
-        id, jid, text: String(args.text), dueAt,
-        repeat: args.repeat === 'daily' || args.repeat === 'weekly' ? args.repeat : null,
-        createdBy: ctx.senderNumber,
-      });
-      return JSON.stringify({ ok: true, id, text: args.text, when: fmtWhen(dueAt) });
+      const repeat = args.repeat === 'daily' || args.repeat === 'weekly' ? args.repeat : null;
+      const r = addReminder(jid, String(args.text), dueAt, repeat, ctx.senderNumber);
+      return JSON.stringify({ ok: true, id: r.seq, text: r.text, when: fmtWhen(r.dueAt) });
     }
     case 'update_reminder': {
-      const r = store.reminders.find((x) => x.jid === jid && x.id === Number(args.id));
-      if (!r) return fail(`no reminder #${args.id} in this chat`);
+      const patch: { text?: string; dueAt?: number } = {};
       if (args.when) {
         const dueAt = parseWhen(args.when);
         if (dueAt === null) return fail('bad "when" format — use "YYYY-MM-DD HH:MM" (24h, agent timezone)');
-        r.dueAt = dueAt;
+        patch.dueAt = dueAt;
       }
-      if (args.text) r.text = String(args.text);
-      return JSON.stringify({ ok: true, id: r.id, text: r.text, when: fmtWhen(r.dueAt) });
+      if (args.text) patch.text = String(args.text);
+      const r = updateReminder(jid, Number(args.id), patch);
+      if (!r) return fail(`no reminder #${args.id} in this chat`);
+      return JSON.stringify({ ok: true, id: r.seq, text: r.text, when: fmtWhen(r.dueAt) });
     }
     case 'delete_reminder': {
-      const i = store.reminders.findIndex((x) => x.jid === jid && x.id === Number(args.id));
-      if (i === -1) return fail(`no reminder #${args.id} in this chat`);
-      const [gone] = store.reminders.splice(i, 1);
-      return JSON.stringify({ ok: true, deleted: { id: gone.id, text: gone.text } });
+      const gone = deleteReminder(jid, Number(args.id));
+      if (!gone) return fail(`no reminder #${args.id} in this chat`);
+      return JSON.stringify({ ok: true, deleted: { id: gone.seq, text: gone.text } });
     }
     case 'list_reminders': {
-      return JSON.stringify({ ok: true, reminders: describeReminders(store, jid) });
+      return JSON.stringify({ ok: true, reminders: describeReminders(jid) });
     }
     case 'mark_meetup': {
-      if (!cfg.meetup.groupJid || cfg.meetup.groupJid !== jid) return fail('this chat is not the meetup group');
-      const st = store.meetupState;
-      if (st.date !== todayStr()) { st.date = todayStr(); st.asked = false; st.missedPosted = false; }
+      if (getMeetupGroupJid(cfg) !== jid) return fail('this chat is not the meetup group');
+      const st = getMeetupState();
+      if (st.date !== todayStr()) {
+        st.date = todayStr();
+        st.asked = false;
+        st.missedPosted = false;
+      }
       st.status = args.status === 'confirmed' ? 'confirmed' : 'missed';
+      setMeetupState(st);
       return JSON.stringify({ ok: true, status: st.status });
     }
     case 'setup_meetup_here': {
       if (!ctx.isOwner) return fail('only the owner can do this');
-      cfg.meetup.groupJid = jid;
-      if (/^\d{1,2}:\d{2}$/.test(args.ask_time || '')) cfg.meetup.askTime = args.ask_time;
-      if (/^\d{1,2}:\d{2}$/.test(args.cutoff_time || '')) cfg.meetup.cutoffTime = args.cutoff_time;
-      if (ctx.saveCfg) ctx.saveCfg();
-      return JSON.stringify({ ok: true, groupJid: jid, askTime: cfg.meetup.askTime, cutoffTime: cfg.meetup.cutoffTime });
+      setMeetupGroupJid(jid);
+      cfg.meetup.enabled = true;
+      const ask = /^\d{1,2}:\d{2}$/.test(String(args.ask_time || '')) ? String(args.ask_time) : cfg.meetup.askTime;
+      const cutoff = /^\d{1,2}:\d{2}$/.test(String(args.cutoff_time || '')) ? String(args.cutoff_time) : cfg.meetup.cutoffTime;
+      setMeetupTimes(ask, cutoff);
+      return JSON.stringify({ ok: true, groupJid: jid, askTime: ask, cutoffTime: cutoff });
     }
     default:
       return fail(`unknown tool ${name}`);

@@ -1,10 +1,12 @@
 {
   "name": "octopus-agent-template",
   "version": "1.0.0",
-  "description": "Self-hosted WhatsApp AI agent (Baileys + LLM tool-calling): reminders, a daily meetup flow, strict access control, and a personality you define.",
+  "description": "Self-hosted WhatsApp AI agent in TypeScript (Baileys + LLM tool-calling + SQLite): reminders, a daily meetup flow, strict access control, and a Next.js dashboard that generates your config.",
   "main": "index.js",
   "scripts": {
-    "start": "node src/index.js"
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
   },
   "keywords": [],
   "author": "theajmalrazaq",
@@ -16,5 +18,11 @@
     "qrcode": "^1.5.4",
     "undici": "^8.12.3"
   },
-  "type": "module"
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/qrcode": "^1.5.6",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
 }

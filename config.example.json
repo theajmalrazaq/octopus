@@ -8,6 +8,18 @@
     "model": "openai/gpt-oss-120b",
     "apiBase": "https://api.groq.com/openai/v1"
   },
+  "persona": {
+    "gender": "neutral",
+    "voiceNotes": "",
+    "ownerNotes": ""
+  },
+  "timetable": {
+    "1": [{ "start": "09:00", "end": "17:00", "name": "Work" }],
+    "2": [{ "start": "09:00", "end": "17:00", "name": "Work" }],
+    "3": [{ "start": "09:00", "end": "17:00", "name": "Work" }],
+    "4": [{ "start": "09:00", "end": "17:00", "name": "Work" }],
+    "5": [{ "start": "09:00", "end": "17:00", "name": "Work" }]
+  },
   "meetup": {
     "enabled": false,
     "groupJid": "",
