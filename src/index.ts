@@ -15,6 +15,10 @@ import {
   contactCount, getContact, getGroup, getMeetupGroupJid, getOwnerLid, setContact, setGroup, setOwnerLid,
 } from './db.js';
 import { handleMessage } from './brain.js';
+import { synthesizeVoice } from './tts.js';
+import { extractQuoted, extractText, mentionedJidsOf, ownAudioNode, ownImageNode, unwrapMessage } from './message.js';
+import { transcribeAudio } from './transcribe.js';
+import { downloadMediaNode } from './mediadl.js';
 import { isAllowed, isOwnerSender } from './access.js';
 import { llmCompose } from './llm.js';
 import { runScheduler } from './scheduler.js';
@@ -36,32 +40,6 @@ let botLid = '';
 let pairingRequested = false;
 let isRegistered = false;
 
-function unwrapMessage(m: AnyMsg): AnyMsg {
-  let cur = m || {};
-  for (let i = 0; i < 5; i++) {
-    const inner =
-      cur.ephemeralMessage?.message ||
-      cur.viewOnceMessage?.message ||
-      cur.viewOnceMessageV2?.message ||
-      cur.documentWithCaptionMessage?.message;
-    if (!inner) break;
-    cur = inner;
-  }
-  return cur;
-}
-
-function extractText(msg: AnyMsg): string {
-  const m = unwrapMessage(msg.message);
-  return (
-    m.conversation ||
-    m.extendedTextMessage?.text ||
-    m.imageMessage?.caption ||
-    m.videoMessage?.caption ||
-    m.documentMessage?.caption ||
-    ''
-  );
-}
-
 function isMentioned(msg: AnyMsg): boolean {
   const m = unwrapMessage(msg.message);
   const ctxInfo =
@@ -73,12 +51,30 @@ function isMentioned(msg: AnyMsg): boolean {
   return mentioned.some((j) => mine.includes(j.split('@')[0].split(':')[0]));
 }
 
-async function send(jid: string, text: string): Promise<void> {
+async function send(jid: string, text: string, mentions?: string[]): Promise<void> {
   if (!sock) return;
   try {
-    await sock.sendMessage(jid, { text });
+    await sock.sendMessage(jid, { text, ...(mentions && mentions.length ? { mentions } : {}) });
   } catch (e) {
     console.error('send failed', jid, (e as Error)?.message);
+  }
+}
+
+// Outbound channel for the send_message tool: text, or a voice note
+// synthesized on demand. Reports success/failure back to the brain.
+async function sendOut(jid: string, payload: { text: string; voice: boolean }): Promise<{ ok: boolean; error?: string }> {
+  if (!sock) return { ok: false, error: 'not connected' };
+  try {
+    if (payload.voice) {
+      const ogg = await synthesizeVoice(payload.text);
+      await sock.sendMessage(jid, { audio: ogg, ptt: true, mimetype: 'audio/ogg; codecs=opus' });
+    } else {
+      await sock.sendMessage(jid, { text: payload.text });
+    }
+    return { ok: true };
+  } catch (e) {
+    console.error('sendOut failed', jid, (e as Error)?.message);
+    return { ok: false, error: (e as Error)?.message };
   }
 }
 
@@ -151,9 +147,29 @@ async function onMessage(msg: AnyMsg): Promise<void> {
     }
   }
 
+  // Other people @mentioned in this message (the bot excluded), with names —
+  // so the brain knows who a request is about and can pin reminders to them.
+  const mentions = mentionedJidsOf(msg)
+    .filter((j) => {
+      const d = j.split('@')[0].split(':')[0];
+      return d && d !== botJid.split('@')[0] && d !== botLid && d !== cfg.botNumber;
+    })
+    .map((j) => {
+      const d = j.split('@')[0].split(':')[0];
+      const member = groupContext?.members.find((m) => m.lid === d || m.pn === d);
+      return { jid: j, name: member?.name || getContact(d) || '' };
+    });
+
   const raw = extractText(msg).trim();
+  // Quoted replies: what message is this a reply to, and was it the bot's?
+  const quoted = extractQuoted(msg);
+  const quotedDigits = (quoted?.participant || '').split('@')[0].split(':')[0];
+  const quotedFromBot = Boolean(quoted && quotedDigits &&
+    [botJid.split('@')[0], botLid, cfg.botNumber].filter(Boolean).includes(quotedDigits));
   console.log(`msg from ${senderNumber} (${isGroup ? 'group ' + jid : 'dm'}): ${JSON.stringify(raw.slice(0, 80))}`);
-  if (!raw) return;
+  // A bare image with no caption still deserves a reaction; other empty
+  // messages (stickers, reactions, calls) are ignored.
+  if (!raw && !ownImageNode(msg) && !ownAudioNode(msg)) return;
 
   // Addressing rules: DM -> always; group -> mentioned, name-prefixed, or meetup group flow.
   // Mentions may reference the bot's phone number OR its LID.
@@ -168,7 +184,8 @@ async function onMessage(msg: AnyMsg): Promise<void> {
   const inMeetupGroup = cfg.meetup.enabled && Boolean(meetupJid) && meetupJid === jid;
   const meetupWord = /^(yes|yeah|yep|no|confirmed|done|met|we met|ok|okay|can'?t|cannot|not today)\b/i.test(raw);
 
-  if (isGroup && !mentionsBot && !startsWithName && !(inMeetupGroup && meetupWord)) return;
+  const audioNode = ownAudioNode(msg);
+  if (!audioNode && isGroup && !mentionsBot && !startsWithName && !quotedFromBot && !(inMeetupGroup && meetupWord)) return;
 
   // Clean the text for the brain: drop leading @mentions and the bot's name.
   let text = raw.replace(/^@\d+\s*/g, '').trim();
@@ -184,11 +201,106 @@ async function onMessage(msg: AnyMsg): Promise<void> {
     return;
   }
 
+  // Voice notes (only after the gate, so strangers cost nothing): transcribe
+  // and treat the transcript as the message text. In groups the addressing
+  // rules are then applied to the transcript — a voice note that never
+  // mentions the bot is none of its business.
+  let voiceNote = false;
+  let quotedText = quoted?.text || '';
+  if (audioNode) {
+    try {
+      const buf = await downloadMediaNode(audioNode.audioMessage, 'audio');
+      const transcript = await transcribeAudio(cfg, buf, audioNode.audioMessage?.mimetype || 'audio/ogg');
+      if (!transcript) {
+        if (!isGroup) await send(jid, 'voice note samajh nahi ayi.. dobara bhej do');
+        return;
+      }
+      text = transcript;
+      voiceNote = true;
+      if (isGroup) {
+        const t = text.toLowerCase();
+        const addressed =
+          quotedFromBot ||
+          (botLid && text.includes(`@${botLid}`)) ||
+          text.includes(`@${botJid.split('@')[0]}`) ||
+          t.startsWith(nameLower) ||
+          (inMeetupGroup && /^(yes|yeah|yep|no|confirmed|done|met|we met|ok|okay|can'?t|cannot|not today)\b/i.test(text));
+        if (!addressed) return;
+        text = text.replace(/^@\d+\s*/g, '').trim();
+        if (text.toLowerCase().startsWith(nameLower)) {
+          text = text.slice(cfg.botName.length).replace(/^[\s,:-]+/, '');
+        }
+      }
+      console.log(`voice note from ${senderNumber} transcribed: ${JSON.stringify(text.slice(0, 80))}`);
+    } catch (e) {
+      console.error('voice note handling failed:', (e as Error)?.message);
+      return;
+    }
+  } else if (quoted?.hasAudio && quoted.node) {
+    // A text reply to a voice note ("what did they say?") — give the brain
+    // the transcript as the quoted content.
+    try {
+      const qAudio = unwrapMessage(quoted.node)?.audioMessage;
+      if (!qAudio) throw new Error('quoted audio node missing');
+      const buf = await downloadMediaNode(qAudio, 'audio');
+      const transcript = await transcribeAudio(cfg, buf, 'audio/ogg');
+      if (transcript) quotedText = transcript;
+    } catch (e) {
+      console.error('quoted voice note transcription failed:', (e as Error)?.message);
+    }
+  }
+
+  // Media (only after the gate, so strangers cost nothing): the message's own
+  // image, or the image it quotes. Failures just mean a text-only turn —
+  // except the brain is told (imageFailed), so it admits it can't see it
+  // instead of hallucinating a description.
+  let image: MsgContext['image'] = null;
+  let imageFailed = false;
+  try {
+    if (ownImageNode(msg)) {
+      const node = ownImageNode(msg)?.imageMessage;
+      const buf = await downloadMediaNode(node, 'image');
+      image = { base64: buf.toString('base64'), mime: node?.mimetype || 'image/jpeg' };
+    } else if (quoted?.hasImage && quoted.node) {
+      const qImg = unwrapMessage(quoted.node)?.imageMessage;
+      if (!qImg) throw new Error('quoted image node missing');
+      const buf = await downloadMediaNode(qImg, 'image');
+      image = { base64: buf.toString('base64'), mime: qImg?.mimetype || 'image/jpeg' };
+    }
+  } catch (e) {
+    imageFailed = Boolean(ownImageNode(msg) || quoted?.hasImage);
+    console.error('media download failed:', (e as Error)?.message);
+  }
+
   const ctx: MsgContext = {
     jid, isGroup, senderNumber, isOwner, groupContext,
     senderName: msg.pushName || '',
+    quoted: quoted ? { text: quotedText, hasImage: quoted.hasImage, fromBot: quotedFromBot } : null,
+    image,
+    imageFailed,
+    voiceNote,
+    mentions,
   };
-  const replies = await handleMessage(cfg, ctx, text);
+  // Deferred retry: when the brain is quota-blocked with a known wait, it
+  // tells the chat it will try again after that long and hands the turn
+  // here — re-run it once when the wait elapses. In-memory on purpose: a
+  // restart during the wait drops the retry (acceptable, the owner can
+  // simply re-ask).
+  const defer = (delaySec: number): void => {
+    console.log(`deferring turn in ${jid} by ${delaySec}s (quota)`);
+    setTimeout(() => {
+      void (async () => {
+        try {
+          const retryCtx: MsgContext = { ...ctx, deferredOnce: true };
+          const out = await handleMessage(cfg, retryCtx, text, sendOut, defer);
+          for (const r of out) await send(jid, r);
+        } catch (e) {
+          console.error('deferred retry failed', jid, (e as Error)?.message);
+        }
+      })();
+    }, delaySec * 1000);
+  };
+  const replies = await handleMessage(cfg, ctx, text, sendOut, defer);
   for (const r of replies) await send(jid, r);
 }
 
@@ -315,7 +427,7 @@ setInterval(async () => {
   try {
     await runScheduler(cfg, {
       send,
-      compose: (jid, instruction) => llmCompose(cfg, jid, instruction),
+      compose: (jid, instruction, groupContext) => llmCompose(cfg, jid, instruction, groupContext),
     });
   } catch (e) {
     console.error('scheduler error', e);

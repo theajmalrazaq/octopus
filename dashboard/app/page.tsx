@@ -52,6 +52,11 @@ export default function Page() {
   const [apiBase, setApiBase] = useState(PROVIDERS.groq.apiBase);
   const [model, setModel] = useState(PROVIDERS.groq.model);
   const [apiKey, setApiKey] = useState('');
+  // Voice & vision
+  const [visionModel, setVisionModel] = useState('qwen/qwen3.8-27b');
+  const [whisperModel, setWhisperModel] = useState('whisper-large-v3-turbo');
+  const [elevenLabsApiKey, setElevenLabsApiKey] = useState('');
+  const [elevenLabsVoiceId, setElevenLabsVoiceId] = useState('');
   // Persona + memories
   const [gender, setGender] = useState<Gender>('neutral');
   const [voiceNotes, setVoiceNotes] = useState('');
@@ -113,14 +118,20 @@ export default function Page() {
 
   const envFile = useMemo(
     () => [
-      '# Your LLM API key — keep this file private, never commit it.',
+      '# Your API keys — keep this file private, never commit it.',
       `LLM_API_KEY=${apiKey.trim()}`,
       `LLM_API_BASE=${apiBase.trim()}`,
       `LLM_MODEL=${model.trim()}`,
+      '# Vision model for image messages, and Whisper model for transcribing voice notes (same provider).',
+      `VISION_MODEL=${visionModel.trim()}`,
+      `WHISPER_MODEL=${whisperModel.trim()}`,
+      '# ElevenLabs — only needed for OUTGOING voice notes (needs ffmpeg installed). Empty = off.',
+      `ELEVENLABS_API_KEY=${elevenLabsApiKey.trim()}`,
+      `ELEVENLABS_VOICE_ID=${elevenLabsVoiceId.trim()}`,
       `AGENT_TZ=${timezone.trim() || 'Asia/Karachi'}`,
       '',
     ].join('\n'),
-    [apiKey, apiBase, model, timezone],
+    [apiKey, apiBase, model, timezone, visionModel, whisperModel, elevenLabsApiKey, elevenLabsVoiceId],
   );
 
   const [copied, setCopied] = useState('');
@@ -183,7 +194,26 @@ export default function Page() {
       </section>
 
       <section className="card">
-        <h2>3 · Personality &amp; memories</h2>
+        <h2>3 · Voice &amp; vision (optional)</h2>
+        <p className="hint">The agent can <b>see images</b> (they are routed to a vision model on the same provider) and <b>understand voice notes</b> (transcribed with Whisper on the same provider). For it to <b>reply with voice notes</b> — e.g. when you ask it to voice-message someone — it needs an <a href="https://elevenlabs.io" target="_blank" rel="noreferrer">ElevenLabs</a> API key and <code>ffmpeg</code> installed on the host. All of these land in the <code>.env</code> download.</p>
+        <div className="grid">
+          <label className="f"><span>Vision model (image messages)</span>
+            <input type="text" value={visionModel} onChange={(e) => setVisionModel(e.target.value)} placeholder="qwen/qwen3.8-27b" />
+          </label>
+          <label className="f"><span>Whisper model (voice notes in)</span>
+            <input type="text" value={whisperModel} onChange={(e) => setWhisperModel(e.target.value)} placeholder="whisper-large-v3-turbo" />
+          </label>
+          <label className="f"><span>ElevenLabs API key (voice notes out)</span>
+            <input type="text" value={elevenLabsApiKey} onChange={(e) => setElevenLabsApiKey(e.target.value)} placeholder="sk_…" autoComplete="off" />
+          </label>
+          <label className="f"><span>ElevenLabs voice ID (blank = a stock voice)</span>
+            <input type="text" value={elevenLabsVoiceId} onChange={(e) => setElevenLabsVoiceId(e.target.value)} placeholder="voice id from your ElevenLabs library" autoComplete="off" />
+          </label>
+        </div>
+      </section>
+
+      <section className="card">
+        <h2>4 · Personality &amp; memories</h2>
         <p className="hint">The agent already has a built-in texting style. Use these to make it yours: <b>voice notes</b> shape how it talks, <b>memories</b> are facts it should always know (about you, your people, your routines).</p>
         <div className="grid">
           <label className="f"><span>Persona gender (grammar for its own verbs)</span>
@@ -203,7 +233,7 @@ export default function Page() {
       </section>
 
       <section className="card">
-        <h2>4 · Weekly timetable</h2>
+        <h2>5 · Weekly timetable</h2>
         <p className="hint">Your recurring busy blocks. The agent uses these to answer &ldquo;when is the owner free?&rdquo; and to suggest meetup times. Leave a day empty if nothing is fixed. Delete everything if you don&apos;t want schedule features at all.</p>
         {DAYS.map(({ idx, label }) => (
           <div className="day" key={idx}>
@@ -222,7 +252,7 @@ export default function Page() {
       </section>
 
       <section className="card">
-        <h2>5 · Meetup group (optional)</h2>
+        <h2>6 · Meetup group (optional)</h2>
         <p className="hint">One group where the agent asks every day &ldquo;are we meeting today?&rdquo; and, if nobody confirms by the cutoff, posts a missed note with your longest free slot tomorrow. You pick the actual group later, inside WhatsApp: as the owner, say <code>{botName || 'Nova'} setup meetup here</code> in it.</p>
         <label className="check">
           <input type="checkbox" checked={meetupEnabled} onChange={(e) => setMeetupEnabled(e.target.checked)} />
@@ -239,13 +269,13 @@ export default function Page() {
       </section>
 
       <section className="card">
-        <h2>6 · Groups it may speak in</h2>
+        <h2>7 · Groups it may speak in</h2>
         <p className="hint">Group JIDs, one per line (they look like <code>120363…@g.us</code>). Don&apos;t know them yet? Leave this empty, start the agent, add it to a group and mention it — its console log shows the JID, and the meetup group above is always allowed. You can edit the config file later anytime.</p>
         <textarea value={groupJids} onChange={(e) => setGroupJids(e.target.value)} placeholder={'120363000000000000@g.us'} />
       </section>
 
       <section className="card">
-        <h2>7 · Your files</h2>
+        <h2>8 · Your files</h2>
         <p className="hint">Drop both files in the project root (next to <code>package.json</code>), then run <code>npm install</code>, <code>npm run build</code>, <code>npm start</code> and pair the spare phone.</p>
         <pre className="preview">{configJs}</pre>
         <div className="actions">

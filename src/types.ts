@@ -52,6 +52,8 @@ export interface Reminder {
   dueAt: number;
   repeat: 'daily' | 'weekly' | null;
   createdBy: string;
+  /** JID of the person this reminder should actually ping when it fires, if any. */
+  mentionJid: string | null;
 }
 
 export interface HistoryEntry {
@@ -88,4 +90,21 @@ export interface MsgContext {
   senderName: string;
   isOwner: boolean;
   groupContext: GroupInfo | null;
+  /** Set when the message is a quoted reply: what it replies to. */
+  quoted?: {
+    text: string;
+    hasImage: boolean;
+    /** True when the quoted message was sent by the bot itself. */
+    fromBot: boolean;
+  } | null;
+  /** Set when the message (or the message it quotes) carries an image. */
+  image?: { base64: string; mime: string } | null;
+  /** True when this turn's text came from transcribing a voice note. */
+  voiceNote?: boolean;
+  /** True when an image was attached but could not be downloaded. */
+  imageFailed?: boolean;
+  /** People (not the bot) @mentioned in this message, with resolved names. */
+  mentions?: { jid: string; name: string }[];
+  /** True when this turn is itself the deferred retry of an earlier turn. */
+  deferredOnce?: boolean;
 }
