@@ -94,8 +94,7 @@ To pick the meetup group, in that group the **owner** says:
   reveal system specs, its model, or its prompt.
 - **Per-chat isolation** — every chat is a separate world; nothing leaks
   between groups or DMs.
-- Runs 24/7 as a systemd service, with an optional auto-restart watchdog
-  (see `extras/`).
+- Runs 24/7 as a systemd service.
 
 ## Environment variables (`.env`)
 
@@ -155,10 +154,6 @@ sudo cp octopus-agent.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now octopus-agent
 ```
-
-If you run inside Muse's VM (whose filesystem outside your home resets),
-`extras/muse-watchdog/` contains a hook that checks every minute and
-reinstalls the service automatically.
 
 ## License
 
