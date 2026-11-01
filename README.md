@@ -105,6 +105,8 @@ To pick the meetup group, in that group the **owner** says:
 | `LLM_MODEL` | no | Text model id (default `openai/gpt-oss-120b`). |
 | `VISION_MODEL` | no | Vision model for image turns (default `qwen/qwen3.8-27b`). |
 | `WHISPER_MODEL` | no | Model for transcribing incoming voice notes (default `whisper-large-v3-turbo`). |
+| `WHISPER_LANGUAGE` | no | Pin a transcription language code (e.g. `en`, `ur`). Empty = auto-detect. |
+| `WHISPER_RETRY_LANGUAGE` | no | If a transcript comes back in Devanagari script (Whisper mis-hearing e.g. Urdu as Hindi), retry once pinned to this language code (e.g. `ur`). |
 | `ELEVENLABS_API_KEY` | no | Enables outgoing voice notes. Empty = text only. |
 | `ELEVENLABS_VOICE_ID` | no | ElevenLabs voice for outgoing notes (blank = a stock voice). |
 | `GROQ_TPM_BUDGET` | no | Per-minute token budget for the rate-limit pacer (default `7500`). |

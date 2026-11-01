@@ -12,7 +12,7 @@ import { writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadConfig, ROOT } from './config.js';
 import {
-  contactCount, getContact, getGroup, getMeetupGroupJid, getOwnerLid, setContact, setGroup, setOwnerLid,
+  contactCount, getContact, getGroup, getKv, getMeetupGroupJid, getOwnerLid, setContact, setGroup, setKv, setOwnerLid,
 } from './db.js';
 import { handleMessage } from './brain.js';
 import { synthesizeVoice } from './tts.js';
@@ -223,7 +223,11 @@ async function onMessage(msg: AnyMsg): Promise<void> {
           quotedFromBot ||
           (botLid && text.includes(`@${botLid}`)) ||
           text.includes(`@${botJid.split('@')[0]}`) ||
-          t.startsWith(nameLower) ||
+          // The bot's name ANYWHERE in the transcript counts as
+          // addressed, not just at the start — people naturally say
+          // "...octopus ko bata dena" mid-sentence, and requiring the
+          // name first silently dropped those voice notes.
+          t.includes(nameLower) ||
           (inMeetupGroup && /^(yes|yeah|yep|no|confirmed|done|met|we met|ok|okay|can'?t|cannot|not today)\b/i.test(text));
         if (!addressed) return;
         text = text.replace(/^@\d+\s*/g, '').trim();
@@ -283,22 +287,22 @@ async function onMessage(msg: AnyMsg): Promise<void> {
   };
   // Deferred retry: when the brain is quota-blocked with a known wait, it
   // tells the chat it will try again after that long and hands the turn
-  // here — re-run it once when the wait elapses. In-memory on purpose: a
-  // restart during the wait drops the retry (acceptable, the owner can
-  // simply re-ask).
+  // here — re-run it once when the wait elapses. The turn is PERSISTED
+  // (kv deferredTurns): a restart during the wait used to kill the
+  // in-memory timer outright, so the promised retry silently never
+  // happened. The interval runner below claims whatever a restart left
+  // behind (dropping anything more than 15 min stale).
   const defer = (delaySec: number): void => {
     console.log(`deferring turn in ${jid} by ${delaySec}s (quota)`);
-    setTimeout(() => {
-      void (async () => {
-        try {
-          const retryCtx: MsgContext = { ...ctx, deferredOnce: true };
-          const out = await handleMessage(cfg, retryCtx, text, sendOut, defer);
-          for (const r of out) await send(jid, r);
-        } catch (e) {
-          console.error('deferred retry failed', jid, (e as Error)?.message);
-        }
-      })();
-    }, delaySec * 1000);
+    const entry: DeferredTurn = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      jid, isGroup, senderNumber, senderName: msg.pushName || '', isOwner,
+      text, dueAt: Date.now() + delaySec * 1000,
+    };
+    const list = getKv<DeferredTurn[]>('deferredTurns', []);
+    list.push(entry);
+    setKv('deferredTurns', list.slice(-10));
+    setTimeout(() => { void claimAndRunDeferred(entry.id); }, delaySec * 1000);
   };
   const replies = await handleMessage(cfg, ctx, text, sendOut, defer);
   for (const r of replies) await send(jid, r);
@@ -420,6 +424,42 @@ async function start(): Promise<void> {
     }
   });
 }
+
+// ---------- deferred quota retries (persistent) ----------
+interface DeferredTurn {
+  id: string; jid: string; isGroup: boolean; senderNumber: string;
+  senderName: string; isOwner: boolean; text: string; dueAt: number;
+}
+
+async function claimAndRunDeferred(id: string): Promise<void> {
+  if (!sock) return; // not connected yet — the interval will retry the claim
+  const list = getKv<DeferredTurn[]>('deferredTurns', []);
+  const idx = list.findIndex((d) => d.id === id);
+  if (idx === -1) return; // the other path (timer vs interval) claimed it
+  const [entry] = list.splice(idx, 1);
+  setKv('deferredTurns', list);
+  if (Date.now() - entry.dueAt > 15 * 60 * 1000) return; // stale — drop silently
+  try {
+    const retryCtx: MsgContext = {
+      jid: entry.jid, isGroup: entry.isGroup, senderNumber: entry.senderNumber,
+      senderName: entry.senderName, isOwner: entry.isOwner,
+      groupContext: entry.isGroup ? getGroup(entry.jid) : null,
+      quoted: null, image: null, imageFailed: false, voiceNote: false, mentions: [],
+      deferredOnce: true,
+    };
+    const out = await handleMessage(cfg, retryCtx, entry.text, sendOut, undefined);
+    for (const r of out) await send(entry.jid, r);
+  } catch (e) {
+    console.error('deferred retry failed', entry.jid, (e as Error)?.message);
+  }
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const d of getKv<DeferredTurn[]>('deferredTurns', [])) {
+    if (d.dueAt <= now) void claimAndRunDeferred(d.id);
+  }
+}, 30000);
 
 // Scheduler tick
 setInterval(async () => {

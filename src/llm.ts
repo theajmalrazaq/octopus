@@ -59,10 +59,23 @@ const spendLog: { t: number; tokens: number }[] = [];
 let paceChain: Promise<void> = Promise.resolve();
 
 function estTokens(messages: ChatMessage[]): number {
-  return Math.ceil(JSON.stringify(messages).length / 4) + 200;
+  const json = JSON.stringify(messages);
+  // NEVER measure a base64 image as text: a phone screenshot is ~200KB
+  // of base64, which priced as ~50k "tokens" — more than the entire
+  // per-minute budget — and parked image turns in the pacer FOREVER
+  // (the fit check could never pass). Vision models tokenize an image
+  // in tiles; ~1.2k per image is the right order of magnitude.
+  const images = (json.match(/data:image/g) || []).length;
+  const textOnly = json.replace(/"data:[^"]+"/g, '"img"');
+  return Math.ceil(textOnly.length / 4) + 200 + images * 1200;
 }
 
 async function paceReserve(est: number): Promise<void> {
+  // A single call may legitimately exceed the per-minute budget (it
+  // will simply 429 at the provider and the retry logic handles it) —
+  // parking forever is never the right answer, so the reservation
+  // clamps to the budget and the wait below can always terminate.
+  const want = Math.min(est, TPM_BUDGET);
   let release!: () => void;
   const gate = new Promise<void>((r) => { release = r; });
   const prev = paceChain;
@@ -73,8 +86,8 @@ async function paceReserve(est: number): Promise<void> {
       const now = Date.now();
       while (spendLog.length && now - spendLog[0].t > 60000) spendLog.shift();
       const spent = spendLog.reduce((a, e) => a + e.tokens, 0);
-      if (spent + est <= TPM_BUDGET) {
-        spendLog.push({ t: now, tokens: est });
+      if (spent + want <= TPM_BUDGET) {
+        spendLog.push({ t: now, tokens: want });
         return;
       }
       let acc = spent;
@@ -82,13 +95,30 @@ async function paceReserve(est: number): Promise<void> {
       for (const e of spendLog) {
         acc -= e.tokens;
         wakeAt = e.t + 60000 + 30;
-        if (acc + est <= TPM_BUDGET) break;
+        if (acc + want <= TPM_BUDGET) break;
       }
       await new Promise((r) => setTimeout(r, Math.min(Math.max(wakeAt - now, 250), 50000)));
     }
   } finally {
     release();
   }
+}
+
+// Peek: how long would paceReserve park a call of this size right now?
+// Pure read (mirrors paceReserve's wait computation) so a caller can
+// fail fast — answer honestly and retry later — instead of the turn
+// parking invisibly for most of a minute.
+function paceWaitMs(est: number): number {
+  const now = Date.now();
+  const live = spendLog.filter((e) => now - e.t <= 60000);
+  const spent = live.reduce((a, e) => a + e.tokens, 0);
+  if (spent + est <= TPM_BUDGET) return 0;
+  let acc = spent;
+  for (const e of live) {
+    acc -= e.tokens;
+    if (acc + est <= TPM_BUDGET) return Math.max(0, e.t + 60000 + 30 - now);
+  }
+  return 60000;
 }
 
 function paceAdjust(delta: number): void {
@@ -117,17 +147,49 @@ async function chatCompletion(
     body.tools = opts.tools;
     body.tool_choice = opts.toolChoice || 'auto';
   }
+  // Reasoning models (e.g. gpt-oss) spend many seconds thinking at the
+  // default effort before answering even trivial chat turns. Low
+  // effort keeps a short think and cuts reply latency hard; a chat
+  // assistant's workload rarely needs more.
+  if (String(body.model).startsWith('openai/gpt-oss')) body.reasoning_effort = 'low';
   const apiBase = (process.env.LLM_API_BASE || cfg.llm.apiBase || API_BASE).replace(/\/$/, '');
   const est = estTokens(messages);
   let lastErr: Error | undefined;
   for (let attempt = 0; attempt < 3; attempt++) {
+    // If the pacer would park this call for a long while, fail fast
+    // with a retry-after instead: the caller answers honestly ("I'll
+    // retry in N min") and re-runs the turn, rather than the sender
+    // staring at silence while the call queues invisibly.
+    const waitMs = paceWaitMs(est);
+    if (waitMs > 20000) {
+      const err = new Error(`LLM pacer busy (~${Math.round(waitMs / 1000)}s wait)`) as Error & { retryAfterSec?: number };
+      err.retryAfterSec = Math.ceil(waitMs / 1000);
+      throw err;
+    }
     await paceReserve(est);
-    const res = await undiciFetch(`${apiBase}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${API_KEY}` },
-      body: JSON.stringify(body),
-      dispatcher,
-    });
+    let res: Awaited<ReturnType<typeof undiciFetch>>;
+    try {
+      res = await undiciFetch(`${apiBase}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${API_KEY}` },
+        body: JSON.stringify(body),
+        dispatcher,
+        // A pooled connection can go half-dead (a proxy or NAT silently
+        // dropping it) and hang a fetch FOREVER — the turn then never
+        // completes, never fails, never replies. 45s is generous for
+        // this API; a timeout is handled below as a retryable failure.
+        signal: AbortSignal.timeout(45000),
+      });
+    } catch (err) {
+      paceAdjust(-est); // nothing was consumed — refund the reservation
+      lastErr = err as Error;
+      console.error(`LLM fetch failed (attempt ${attempt + 1}/3):`, (err as Error).message);
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
+      throw lastErr;
+    }
     if (res.ok) {
       const data = (await res.json()) as { choices?: { message?: ChatMessage }[]; usage?: { total_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } };
       // Reconcile the reservation with the real spend. Prompt-cache hits
