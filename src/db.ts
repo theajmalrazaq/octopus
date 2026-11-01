@@ -38,7 +38,43 @@ db.exec(`
     text TEXT NOT NULL,
     ts INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target TEXT NOT NULL,
+    text TEXT NOT NULL,
+    voice INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    jid TEXT,
+    name TEXT,
+    error TEXT,
+    created_at INTEGER NOT NULL,
+    done_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
+  CREATE TABLE IF NOT EXISTS ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    jid TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    who TEXT NOT NULL,
+    other TEXT NOT NULL DEFAULT '',
+    amount REAL NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    split_with TEXT NOT NULL DEFAULT '[]',
+    ts INTEGER NOT NULL,
+    voided INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_ledger_jid ON ledger(jid, id);
+  CREATE TABLE IF NOT EXISTS facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    jid TEXT NOT NULL,
+    fact TEXT NOT NULL,
+    ts INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_facts_jid ON facts(jid, id);
 `);
+// WAL + busy timeout: the Octopus MCP server process shares this database
+// (it queues sends in `outbox`); short concurrent access must not fail.
+db.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
 
 // ---------- kv ----------
 export function getKv<T>(key: string, fallback: T): T {
@@ -248,6 +284,116 @@ export function allGroups(): GroupInfo[] {
   return rows.map((r) => { try { return JSON.parse(r.data) as GroupInfo; } catch { return null; } }).filter(Boolean) as GroupInfo[];
 }
 
+// ---------- money ledger ----------
+// Per-chat durable record of shared expenses and settling payments.
+// Chat history is only the last ~12 turns, so money facts scrolled out of
+// it were simply gone — she answered "idk" to "how much do I have to
+// send?" 22 minutes after computing the split herself (2026-10-29). The
+// ledger is the fix: expenses/payments are rows, balances are computed
+// from them deterministically, and the summary rides in every prompt.
+export interface LedgerEntry {
+  id: number; jid: string; kind: 'expense' | 'payment';
+  who: string; other: string; amount: number; note: string;
+  splitWith: string[]; ts: number;
+}
+interface LedgerRow {
+  id: number; jid: string; kind: string; who: string; other: string;
+  amount: number; note: string; split_with: string; ts: number;
+}
+function toLedger(r: LedgerRow): LedgerEntry {
+  let splitWith: string[] = [];
+  try { splitWith = JSON.parse(r.split_with) as string[]; } catch { /* stored JSON */ }
+  return {
+    id: r.id, jid: r.jid, kind: r.kind === 'payment' ? 'payment' : 'expense',
+    who: r.who, other: r.other, amount: r.amount, note: r.note,
+    splitWith: Array.isArray(splitWith) ? splitWith.map(String) : [], ts: r.ts,
+  };
+}
+export const ledgerNameKey = (n: string): string => n.trim().replace(/\s+/g, ' ').toLowerCase();
+
+export function addLedgerExpense(jid: string, payer: string, amount: number, note: string, splitWith: string[]): LedgerEntry {
+  const info = db.prepare('INSERT INTO ledger (jid, kind, who, other, amount, note, split_with, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(jid, 'expense', payer, '', amount, note, JSON.stringify(splitWith), Date.now());
+  return { id: Number(info.lastInsertRowid), jid, kind: 'expense', who: payer, other: '', amount, note, splitWith, ts: Date.now() };
+}
+export function addLedgerPayment(jid: string, from: string, to: string, amount: number, note: string): LedgerEntry {
+  const info = db.prepare('INSERT INTO ledger (jid, kind, who, other, amount, note, split_with, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(jid, 'payment', from, to, amount, note, '[]', Date.now());
+  return { id: Number(info.lastInsertRowid), jid, kind: 'payment', who: from, other: to, amount, note, splitWith: [], ts: Date.now() };
+}
+export function listLedger(jid: string, limit = 20): LedgerEntry[] {
+  const rows = db.prepare('SELECT * FROM ledger WHERE jid = ? AND voided = 0 ORDER BY id DESC LIMIT ?')
+    .all(jid, limit) as unknown as LedgerRow[];
+  return rows.map(toLedger).reverse();
+}
+export function voidLedgerEntry(jid: string, id: number): LedgerEntry | null {
+  const cur = db.prepare('SELECT * FROM ledger WHERE jid = ? AND id = ? AND voided = 0').get(jid, id) as unknown as LedgerRow | undefined;
+  if (!cur) return null;
+  db.prepare('UPDATE ledger SET voided = 1 WHERE id = ?').run(id);
+  return toLedger(cur);
+}
+
+/** Net pairwise debts for a chat, folded so each pair appears once. */
+export function computeBalances(jid: string): { debtor: string; creditor: string; amount: number }[] {
+  const rows = listLedger(jid, 500);
+  const display = new Map<string, string>();
+  const disp = (n: string): string => {
+    const k = ledgerNameKey(n);
+    if (!display.has(k)) display.set(k, n.trim());
+    return display.get(k)!;
+  };
+  const owe = new Map<string, number>(); // "debtorKey\u0001creditorKey" -> amount debtor owes creditor
+  const addOwe = (debtor: string, creditor: string, amt: number): void => {
+    if (!debtor || !creditor || ledgerNameKey(debtor) === ledgerNameKey(creditor) || amt === 0) return;
+    disp(debtor); disp(creditor);
+    const k = `${ledgerNameKey(debtor)}\u0001${ledgerNameKey(creditor)}`;
+    owe.set(k, (owe.get(k) || 0) + amt);
+  };
+  for (const e of rows) {
+    if (e.kind === 'expense') {
+      const share = e.amount / (e.splitWith.length + 1);
+      for (const p of e.splitWith) addOwe(p, e.who, share);
+    } else {
+      addOwe(e.who, e.other, -e.amount); // a payment reduces what the payer owed the receiver
+    }
+  }
+  const out: { debtor: string; creditor: string; amount: number }[] = [];
+  const seenPairs = new Set<string>();
+  for (const [k, v] of owe) {
+    const [a, b] = k.split('\u0001');
+    const pairKey = [a, b].sort().join('\u0001');
+    if (seenPairs.has(pairKey)) continue;
+    seenPairs.add(pairKey);
+    const net = v - (owe.get(`${b}\u0001${a}`) || 0);
+    if (Math.abs(net) < 0.01) continue;
+    const round = (n: number): number => Math.round(n * 100) / 100;
+    if (net > 0) out.push({ debtor: display.get(a)!, creditor: display.get(b)!, amount: round(net) });
+    else out.push({ debtor: display.get(b)!, creditor: display.get(a)!, amount: round(-net) });
+  }
+  return out;
+}
+
+// ---------- per-chat remembered facts ----------
+// Durable free-form memory per chat ("a friend's exam is on Monday", "we
+// split petrol 3 ways") saved via the remember_fact tool and listed in
+// every prompt for that chat. Money has the ledger and times have
+// reminders; this is for everything else worth keeping.
+export interface Fact { id: number; jid: string; fact: string; ts: number }
+export function addFact(jid: string, fact: string): Fact {
+  const info = db.prepare('INSERT INTO facts (jid, fact, ts) VALUES (?, ?, ?)').run(jid, fact, Date.now());
+  return { id: Number(info.lastInsertRowid), jid, fact, ts: Date.now() };
+}
+export function listFacts(jid: string, limit = 12): Fact[] {
+  const rows = db.prepare('SELECT * FROM facts WHERE jid = ? ORDER BY id DESC LIMIT ?').all(jid, limit) as unknown as Fact[];
+  return rows.reverse();
+}
+export function deleteFact(jid: string, id: number): Fact | null {
+  const cur = db.prepare('SELECT * FROM facts WHERE jid = ? AND id = ?').get(jid, id) as unknown as Fact | undefined;
+  if (!cur) return null;
+  db.prepare('DELETE FROM facts WHERE id = ?').run(id);
+  return cur;
+}
+
 // ---------- sent log (the agent's verifiable outbox) ----------
 
 export interface SentRow { jid: string; kind: 'text' | 'voice'; text: string; ts: number }
@@ -263,4 +409,42 @@ export function recentSends(jid?: string, limit = 8): SentRow[] {
     ? db.prepare('SELECT jid, kind, text, ts FROM sent_log WHERE jid = ? ORDER BY id DESC LIMIT ?').all(jid, limit)
     : db.prepare('SELECT jid, kind, text, ts FROM sent_log ORDER BY id DESC LIMIT ?').all(limit)) as unknown as SentRow[];
   return rows.reverse();
+}
+
+// ---------- MCP outbox ----------
+// External assistants (through the Octopus MCP server in mcp/) queue sends
+// here. Only the gateway process holds the WhatsApp socket, so it drains
+// this table and performs each send through the normal send path; the MCP
+// server polls the row for the outcome.
+export interface OutboxRow {
+  id: number; target: string; text: string; voice: boolean;
+  status: string; jid: string; name: string; error: string;
+  createdAt: number; doneAt: number;
+}
+interface OutboxDbRow {
+  id: number; target: string; text: string; voice: number;
+  status: string; jid: string | null; name: string | null; error: string | null;
+  created_at: number; done_at: number | null;
+}
+function toOutbox(r: OutboxDbRow): OutboxRow {
+  return {
+    id: r.id, target: r.target, text: r.text, voice: r.voice === 1,
+    status: r.status, jid: r.jid || '', name: r.name || '', error: r.error || '',
+    createdAt: r.created_at, doneAt: r.done_at || 0,
+  };
+}
+export function pendingOutbox(limit = 3): OutboxRow[] {
+  const rows = db.prepare("SELECT * FROM outbox WHERE status = 'pending' ORDER BY id ASC LIMIT ?").all(limit) as unknown as OutboxDbRow[];
+  return rows.map(toOutbox);
+}
+/** Atomically claim a pending row so overlapping ticks never send it twice. */
+export function claimOutbox(id: number): boolean {
+  const info = db.prepare("UPDATE outbox SET status = 'sending' WHERE id = ? AND status = 'pending'").run(id);
+  return Number(info.changes) > 0;
+}
+export function completeOutbox(id: number, jid: string, name: string): void {
+  db.prepare("UPDATE outbox SET status = 'sent', jid = ?, name = ?, done_at = ? WHERE id = ?").run(jid, name, Date.now(), id);
+}
+export function failOutbox(id: number, error: string): void {
+  db.prepare("UPDATE outbox SET status = 'failed', error = ?, done_at = ? WHERE id = ?").run(error.slice(0, 500), Date.now(), id);
 }

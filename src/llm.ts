@@ -9,7 +9,7 @@ import path from 'node:path';
 import { fetch as undiciFetch, ProxyAgent } from 'undici';
 import { DAY_NAMES, dayBlocks, fmtTime, freeSlots, hasSchedule, scheduleSummary } from './timetable.js';
 import { todayStr, addDays, weekdayOf, tz } from './time.js';
-import { TOOLS, OWNER_TOOLS, applyTool, describeReminders, describeSends, type SendOut } from './actions.js';
+import { TOOLS, OWNER_TOOLS, applyTool, describeFacts, describeLedger, describeReminders, describeSends, type SendOut } from './actions.js';
 import { getHistory, getMeetupGroupJid, getMeetupState, pushHistory } from './db.js';
 import type { AgentConfig, MsgContext } from './types.js';
 
@@ -25,6 +25,7 @@ function loadDotEnv(): void {
 loadDotEnv();
 
 const API_KEY = process.env.LLM_API_KEY || '';
+const API_KEY_2 = process.env.LLM_API_KEY_2 || '';
 const API_BASE = (process.env.LLM_API_BASE || 'https://api.groq.com/openai/v1').replace(/\/$/, '');
 const MODEL = process.env.LLM_MODEL || 'openai/gpt-oss-120b';
 // Most text models have no vision. Image turns route to a vision-capable
@@ -46,17 +47,31 @@ interface ChatMessage {
   tool_call_id?: string;
 }
 
-// Rolling per-minute token pacer. Free tiers typically allow only a few
-// thousand tokens/minute for a model, and ONE action turn costs several
-// thousand across its calls — so two turns (or a retry) landing in the same
-// minute blow the budget and 429, even though the daily request budget is
-// nearly untouched. Instead of firing into a guaranteed rejection, calls
-// reserve an estimated spend against the rolling 60s window and wait a few
-// seconds for room when needed. Successful calls reconcile the reservation
-// with the real usage; rejected calls refund it. Tune with GROQ_TPM_BUDGET.
+// Rolling per-minute token pacer, bucketed per provider-chain entry
+// (API key + model), because every key×model pair has its OWN quota pool
+// at the provider (limits are per organization, per model). The free tier
+// allows 8000 tokens/minute for the primary model and ONE action turn
+// costs ~4.5k across its calls — so two turns (or a retry) landing in the
+// same minute blow the budget and 429, even though the daily request
+// budget is nearly untouched. Instead of firing into a guaranteed
+// rejection, calls reserve an estimated spend against their entry's
+// rolling window and wait a few seconds for room when needed. Successful
+// calls reconcile the reservation with the real usage; rejected calls
+// refund it.
 const TPM_BUDGET = Number(process.env.GROQ_TPM_BUDGET || 7500);
-const spendLog: { t: number; tokens: number }[] = [];
-let paceChain: Promise<void> = Promise.resolve();
+interface PacerBucket { log: { t: number; tokens: number }[]; chain: Promise<void> }
+const pacers = new Map<string, PacerBucket>();
+
+function pacerFor(bucketId: string): PacerBucket {
+  let b = pacers.get(bucketId);
+  if (!b) { b = { log: [], chain: Promise.resolve() }; pacers.set(bucketId, b); }
+  return b;
+}
+
+// Diagnostic/test aid: which entry buckets the pacer has touched.
+export function llmPacerBuckets(): string[] {
+  return [...pacers.keys()];
+}
 
 function estTokens(messages: ChatMessage[]): number {
   const json = JSON.stringify(messages);
@@ -70,29 +85,30 @@ function estTokens(messages: ChatMessage[]): number {
   return Math.ceil(textOnly.length / 4) + 200 + images * 1200;
 }
 
-async function paceReserve(est: number): Promise<void> {
+async function paceReserve(bucketId: string, est: number): Promise<void> {
+  const bucket = pacerFor(bucketId);
   // A single call may legitimately exceed the per-minute budget (it
-  // will simply 429 at the provider and the retry logic handles it) —
-  // parking forever is never the right answer, so the reservation
-  // clamps to the budget and the wait below can always terminate.
+  // will simply 429 at the provider and the chain handles it) — parking
+  // forever is never the right answer, so the reservation clamps to
+  // the budget and the wait below can always terminate.
   const want = Math.min(est, TPM_BUDGET);
   let release!: () => void;
   const gate = new Promise<void>((r) => { release = r; });
-  const prev = paceChain;
-  paceChain = gate;
+  const prev = bucket.chain;
+  bucket.chain = gate;
   await prev;
   try {
     for (;;) {
       const now = Date.now();
-      while (spendLog.length && now - spendLog[0].t > 60000) spendLog.shift();
-      const spent = spendLog.reduce((a, e) => a + e.tokens, 0);
+      while (bucket.log.length && now - bucket.log[0].t > 60000) bucket.log.shift();
+      const spent = bucket.log.reduce((a, e) => a + e.tokens, 0);
       if (spent + want <= TPM_BUDGET) {
-        spendLog.push({ t: now, tokens: want });
+        bucket.log.push({ t: now, tokens: want });
         return;
       }
       let acc = spent;
       let wakeAt = now + 1000;
-      for (const e of spendLog) {
+      for (const e of bucket.log) {
         acc -= e.tokens;
         wakeAt = e.t + 60000 + 30;
         if (acc + want <= TPM_BUDGET) break;
@@ -105,31 +121,73 @@ async function paceReserve(est: number): Promise<void> {
 }
 
 // Peek: how long would paceReserve park a call of this size right now?
-// Pure read (mirrors paceReserve's wait computation) so a caller can
-// fail fast — answer honestly and retry later — instead of the turn
-// parking invisibly for most of a minute.
-function paceWaitMs(est: number): number {
+// Pure read (mirrors paceReserve's wait computation) so the chain can
+// hop to an idle pool instead of queueing on a busy one.
+function paceWaitMs(bucketId: string, est: number): number {
+  const bucket = pacerFor(bucketId);
   const now = Date.now();
-  const live = spendLog.filter((e) => now - e.t <= 60000);
-  const spent = live.reduce((a, e) => a + e.tokens, 0);
+  const log = bucket.log.filter((e) => now - e.t <= 60000);
+  const spent = log.reduce((a, e) => a + e.tokens, 0);
   if (spent + est <= TPM_BUDGET) return 0;
   let acc = spent;
-  for (const e of live) {
+  for (const e of log) {
     acc -= e.tokens;
     if (acc + est <= TPM_BUDGET) return Math.max(0, e.t + 60000 + 30 - now);
   }
   return 60000;
 }
 
-function paceAdjust(delta: number): void {
-  if (delta !== 0) spendLog.push({ t: Date.now(), tokens: delta });
+function paceAdjust(bucketId: string, delta: number): void {
+  if (delta !== 0) pacerFor(bucketId).log.push({ t: Date.now(), tokens: delta });
 }
 
-// Diagnostic/test aid: what the pacer currently believes is in the window.
-export function llmPacerState(): { entries: number; spentInWindow: number } {
-  const now = Date.now();
-  const live = spendLog.filter((e) => now - e.t <= 60000);
-  return { entries: live.length, spentInWindow: live.reduce((a, e) => a + e.tokens, 0) };
+// ---- Provider failover chain -------------------------------------------
+// Groq limits are per organization AND per model, so each key×model pair
+// is an independent quota pool. Text turns walk the chain MODEL-MAJOR:
+// the strongest model on every key first, then the next model — so the
+// best available brain serves a turn, whichever key's pool has room.
+// (Key-major order ran a whole afternoon on the weakest model while a
+// fresh top-tier pool sat idle on key 2 — corrected 2026-10-27.) A 429 that signals a DAILY limit (TPD/RPD), or
+// one demanding a wait over 60s, exhausts only that entry — the call hops
+// to the next entry instead of dying. Short per-minute 429s keep the old
+// behavior (brief retries, then fail-fast with retryAfterSec). Vision
+// turns pass an explicit model and stay pinned to key 1, unchanged.
+interface ChainEntry { keyIdx: number; key: string; model: string }
+
+function chainLabel(e: ChainEntry): string {
+  return `key${e.keyIdx + 1}/${e.model}`;
+}
+
+function buildChain(cfg: AgentConfig, explicitModel?: string): ChainEntry[] {
+  if (explicitModel) return [{ keyIdx: 0, key: API_KEY, model: explicitModel }];
+  const primary = process.env.LLM_MODEL || cfg.llm.model || MODEL;
+  const models = [primary, 'openai/gpt-oss-20b', 'qwen/qwen3.8-27b']
+    .filter((m, i, a) => a.indexOf(m) === i);
+  const keys: { keyIdx: number; key: string }[] = [];
+  if (API_KEY) keys.push({ keyIdx: 0, key: API_KEY });
+  if (API_KEY_2) keys.push({ keyIdx: 1, key: API_KEY_2 });
+  const entries: ChainEntry[] = [];
+  for (const model of models) for (const k of keys) entries.push({ keyIdx: k.keyIdx, key: k.key, model });
+  return entries;
+}
+
+function isDailyLimit(bodyText: string): boolean {
+  return /tokens per day|requests per day|\bTPD\b|\bRPD\b/i.test(bodyText);
+}
+
+async function fetchChat(apiBase: string, key: string, body: Record<string, unknown>) {
+  return undiciFetch(`${apiBase}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+    body: JSON.stringify(body),
+    dispatcher,
+    // A pooled proxy connection can go half-dead and hang a fetch
+    // FOREVER — two group turns died silently this way on 2026-10-31
+    // (no error, no history, no reply; the media downloader had the
+    // same disease, fixed 2026-10-30). 45s is generous for this API;
+    // the caller treats a timeout as a retryable network failure.
+    signal: AbortSignal.timeout(45000),
+  });
 }
 
 async function chatCompletion(
@@ -137,86 +195,122 @@ async function chatCompletion(
   messages: ChatMessage[],
   opts: { tools?: unknown; toolChoice?: string; maxTokens?: number; model?: string } = {},
 ): Promise<ChatMessage | undefined> {
-  const body: Record<string, unknown> = {
-    model: opts.model || process.env.LLM_MODEL || cfg.llm.model || MODEL,
-    messages,
-    temperature: 0.4,
-    max_tokens: opts.maxTokens ?? 400,
-  };
-  if (opts.tools) {
-    body.tools = opts.tools;
-    body.tool_choice = opts.toolChoice || 'auto';
-  }
-  // Reasoning models (e.g. gpt-oss) spend many seconds thinking at the
-  // default effort before answering even trivial chat turns. Low
-  // effort keeps a short think and cuts reply latency hard; a chat
-  // assistant's workload rarely needs more.
-  if (String(body.model).startsWith('openai/gpt-oss')) body.reasoning_effort = 'low';
   const apiBase = (process.env.LLM_API_BASE || cfg.llm.apiBase || API_BASE).replace(/\/$/, '');
   const est = estTokens(messages);
+  const chain = buildChain(cfg, opts.model);
+  const hopWaits: number[] = [];
   let lastErr: Error | undefined;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    // If the pacer would park this call for a long while, fail fast
-    // with a retry-after instead: the caller answers honestly ("I'll
-    // retry in N min") and re-runs the turn, rather than the sender
-    // staring at silence while the call queues invisibly.
-    const waitMs = paceWaitMs(est);
-    if (waitMs > 20000) {
-      const err = new Error(`LLM pacer busy (~${Math.round(waitMs / 1000)}s wait)`) as Error & { retryAfterSec?: number };
-      err.retryAfterSec = Math.ceil(waitMs / 1000);
-      throw err;
+  for (let ci = 0; ci < chain.length; ci++) {
+    const entry = chain[ci];
+    const bucket = `${entry.keyIdx}:${entry.model}`;
+    const body: Record<string, unknown> = {
+      model: entry.model,
+      messages,
+      temperature: 0.4,
+      max_tokens: opts.maxTokens ?? 400,
+    };
+    if (opts.tools) {
+      body.tools = opts.tools;
+      body.tool_choice = opts.toolChoice || 'auto';
     }
-    await paceReserve(est);
-    let res: Awaited<ReturnType<typeof undiciFetch>>;
-    try {
-      res = await undiciFetch(`${apiBase}/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${API_KEY}` },
-        body: JSON.stringify(body),
-        dispatcher,
-        // A pooled connection can go half-dead (a proxy or NAT silently
-        // dropping it) and hang a fetch FOREVER — the turn then never
-        // completes, never fails, never replies. 45s is generous for
-        // this API; a timeout is handled below as a retryable failure.
-        signal: AbortSignal.timeout(45000),
-      });
-    } catch (err) {
-      paceAdjust(-est); // nothing was consumed — refund the reservation
-      lastErr = err as Error;
-      console.error(`LLM fetch failed (attempt ${attempt + 1}/3):`, (err as Error).message);
-      if (attempt < 2) {
-        await new Promise((r) => setTimeout(r, 1500));
+    // gpt-oss is a reasoning model: at the default effort it spends many
+    // seconds thinking before answering even trivial chat turns. Low
+    // effort keeps a short think and cuts reply latency hard; her
+    // workload (chat, reminders, ledger, quick lookups) doesn't need more.
+    if (entry.model.startsWith('openai/gpt-oss')) body.reasoning_effort = 'low';
+    // Latency: if this entry's pacer would park the call beyond a few
+    // seconds and other entries exist, hop NOW — the chain's other
+    // key×model pools are usually idle. Back-to-back chat turns used to
+    // stack ~30s waits on entry #1 while five pools sat empty.
+    if (ci < chain.length - 1) {
+      const waitMs = paceWaitMs(bucket, est);
+      if (waitMs > 3000) {
+        hopWaits.push(Math.max(5, Math.ceil(waitMs / 1000)));
+        console.log(`LLM pacing: ${chainLabel(entry)} busy (~${Math.round(waitMs / 1000)}s wait) — trying ${chainLabel(chain[ci + 1])}`);
         continue;
       }
-      throw lastErr;
     }
-    if (res.ok) {
-      const data = (await res.json()) as { choices?: { message?: ChatMessage }[]; usage?: { total_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } };
-      // Reconcile the reservation with the real spend. Prompt-cache hits
-      // are free against the rate limit, so the effective spend is total
-      // minus cached.
-      const cached = data.usage?.prompt_tokens_details?.cached_tokens || 0;
-      paceAdjust(Math.max(0, (data.usage?.total_tokens || est) - cached) - est);
-      return data.choices?.[0]?.message;
+    let hopped = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await paceReserve(bucket, est);
+      let res: Awaited<ReturnType<typeof fetchChat>>;
+      try {
+        res = await fetchChat(apiBase, entry.key, body);
+      } catch (err) {
+        // Network failure / timeout: refund the reservation, retry
+        // briefly, then hop to the next chain entry. If every entry
+        // dies this way the final throw carries a 30s retryAfterSec
+        // and the caller defers the turn (now persistently).
+        paceAdjust(bucket, -est);
+        lastErr = err as Error;
+        console.error(`LLM fetch failed on ${chainLabel(entry)} (attempt ${attempt + 1}/3):`, (err as Error).message);
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 1500));
+          continue;
+        }
+        hopWaits.push(30);
+        hopped = true;
+        break;
+      }
+      if (res.ok) {
+        const data = (await res.json()) as { choices?: { message?: ChatMessage }[]; usage?: { total_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } };
+        // Reconcile the reservation with the real spend. Prompt-cache hits
+        // are free against the rate limit (Groq docs), so the effective
+        // spend is total minus cached.
+        const cached = data.usage?.prompt_tokens_details?.cached_tokens || 0;
+        paceAdjust(bucket, Math.max(0, (data.usage?.total_tokens || est) - cached) - est);
+        if (hopWaits.length) console.log(`LLM failover: served by ${chainLabel(entry)} after ${hopWaits.length} exhausted ${hopWaits.length === 1 ? 'entry' : 'entries'}`);
+        return data.choices?.[0]?.message;
+      }
+      paceAdjust(bucket, -est); // rejected calls consume nothing — refund the reservation
+      const raw = await res.text();
+      lastErr = new Error(`LLM HTTP ${res.status}: ${raw.slice(0, 160)}`);
+      if (res.status !== 429) {
+        // A model that doesn't exist on this account (404 model_not_found)
+        // is a dead ENTRY, not a dead turn — hop while entries remain.
+        if (res.status === 404 && /model_not_found|does not exist/i.test(raw) && ci < chain.length - 1) {
+          hopWaits.push(86400);
+          console.error(`LLM failover: ${chainLabel(entry)} unavailable (model not found) — trying ${chainLabel(chain[ci + 1])}`);
+          hopped = true;
+          break;
+        }
+        throw lastErr;
+      }
+      const retryAfterSec = Number(res.headers.get('retry-after')) || 0;
+      const daily = isDailyLimit(raw);
+      const wait = retryAfterSec * 1000 || (attempt === 0 ? 4000 : 10000);
+      if (daily || wait > 60000) {
+        // This entry's pool is done for a long while — hop to the next
+        // chain entry rather than parking or killing the turn.
+        const waitSec = retryAfterSec || (daily ? 900 : Math.ceil(wait / 1000));
+        hopWaits.push(waitSec);
+        const next = chain[ci + 1];
+        console.error(`LLM failover: ${chainLabel(entry)} exhausted (${daily ? 'daily limit' : `Retry-After ${waitSec}s`})${next ? ` — trying ${chainLabel(next)}` : ' — no entries left'}`);
+        hopped = true;
+        break;
+      }
+      // Short per-minute burst on this entry. Retry briefly; if the
+      // provider demands a longer wait (but not chain-hop territory),
+      // fail fast as before so the caller can defer the turn honestly
+      // instead of the bot looking dead for minutes.
+      if (wait > 20000) {
+        console.error(`LLM 429 with Retry-After ${Math.round(wait / 1000)}s — failing fast instead of parking the turn`);
+        const err = lastErr as Error & { retryAfterSec?: number };
+        err.retryAfterSec = Math.ceil(wait / 1000);
+        throw err;
+      }
+      console.error(`LLM 429, retrying in ${wait}ms`);
+      await new Promise((r) => setTimeout(r, wait));
     }
-    paceAdjust(-est); // rejected calls consume nothing — refund the reservation
-    const text = (await res.text()).slice(0, 160);
-    lastErr = new Error(`LLM HTTP ${res.status}: ${text}`);
-    if (res.status !== 429) throw lastErr;
-    // Free-tier token limit. Short bursts recover in seconds — retry those.
-    // But when the provider demands a LONG wait (quota exhausted, Retry-After
-    // of many minutes), parking the turn makes the agent look dead: the
-    // sender gets silence for 10+ minutes. Fail fast instead so the caller
-    // can answer honestly and re-run the turn when quota is back.
-    const wait = Number(res.headers.get('retry-after')) * 1000 || (attempt === 0 ? 4000 : 10000);
-    if (wait > 20000) {
-      console.error(`LLM 429 with Retry-After ${Math.round(wait / 1000)}s — failing fast instead of parking the turn`);
-      const err = lastErr as Error & { retryAfterSec?: number };
-      err.retryAfterSec = Math.ceil(wait / 1000);
-      throw err;
-    }
-    console.error(`LLM 429, retrying in ${wait}ms`);
-    await new Promise((r) => setTimeout(r, wait));
+    if (!hopped) throw lastErr; // attempts exhausted on short 429s — old behavior
+  }
+  // Every entry hopped: the whole chain is quota-exhausted. Surface the
+  // SMALLEST wait across the chain so the deferred retry fires as early
+  // as any pool refills.
+  if (hopWaits.length) {
+    const err = (lastErr || new Error('LLM chain exhausted')) as Error & { retryAfterSec?: number };
+    err.retryAfterSec = Math.min(...hopWaits);
+    throw err;
   }
   throw lastErr;
 }
@@ -271,6 +365,10 @@ export function systemPrompt(cfg: AgentConfig, ctx: MsgContext): string {
   );
   lines.push(
     `You manage reminders ONLY through your tools: set_reminder, update_reminder, delete_reminder, list_reminders. Rules: when someone corrects a reminder (new time, "sorry 5:59", "make it 6 instead"), UPDATE the existing one — never create a duplicate. When someone asks what reminders exist, answer from the reminder list at the end of this prompt or call list_reminders; never guess. After using tools, confirm in one short line. Never invent a reminder that isn't in the list. In reminder text, write people's NAMES (from the group context), never @numbers or LIDs.`,
+    `MONEY LEDGER: this chat has a money ledger (its current state is at the end of this prompt) — your durable memory for shared expenses and debts in this chat. It stays correct even after old messages scroll out of the conversation, so trust it over reconstruction. Rules: when someone says they spent or paid for something shared, call log_expense in that SAME turn — never wait to be asked to record it. When someone says they paid or transferred money to another person here, call record_payment. When anyone asks the balance or who owes whom, answer from the ledger (call get_balance if you need it fresh) and give the exact number. Record stated amounts exactly — don't round, don't argue.`,
+    `MEMORY: the conversation above, the ledger, and the remembered facts at the end of this prompt ARE your memory of this chat. Before saying you don't know something about this chat — an amount, a split, a decision, a plan, a name — scan them first. When someone tells you something durable about this chat (a plan, a date, a preference, who someone is), save it with remember_fact so you still know it next week.`,
+    `GENERAL ASSISTANT: you are not only a reminder bot — answer questions properly: general knowledge, math, explanations, summaries of screenshots and text, translations, drafting and fixing wording. For facts about the outside world that could be stale — news, prices, scores, current anything — use web_search instead of guessing, and fetch_page to open a specific link someone shares. Say plainly when a search found nothing.`,
+
     `CLAIMING ACTIONS: only say you sent, set, or did something if a tool result confirms it — a send counts ONLY when it appears in your outbox (given at the end of this prompt). Your memory of "I already sent it" is NOT proof; conversation lines like "message sent" from earlier turns can be about a different message or a different kind (a text is not a voice note). If asked whether something was sent and it is not in the outbox, say plainly that it did NOT go through. Never bluff a completed action.`,
   );
   if (hasSchedule(cfg.timetable)) {
@@ -289,6 +387,10 @@ export function systemPrompt(cfg: AgentConfig, ctx: MsgContext): string {
     `The person writing now is ${ctx.senderName || 'someone'}${ctx.isOwner ? ' (the owner)' : ''}.`,
     `Reminders currently set in THIS chat: ${describeReminders(ctx.jid)}. Each chat has its own reminders with its own numbering — other chats' reminders do not exist as far as you are concerned.`,
   ];
+  const ledgerLine = describeLedger(ctx.jid);
+  if (ledgerLine) dyn.push(ledgerLine);
+  const factsLine = describeFacts(ctx.jid);
+  if (factsLine) dyn.push(factsLine);
   // The verifiable outbox. Owner's DM sees all of it; any other chat sees
   // only what was sent to that chat.
   const outbox = describeSends(!ctx.isGroup && ctx.isOwner ? null : ctx.jid);
@@ -359,6 +461,10 @@ function synthConfirm(actionNotes: string[]): string {
       if (name === 'update_reminder') return `updated — ${String(r.when || '')}`.trim();
       if (name === 'delete_reminder') return 'deleted';
       if (name === 'list_reminders') return String(r.text || 'no reminders');
+      if (name === 'log_expense' || name === 'record_payment' || name === 'void_ledger_entry') return String(r.summary || 'logged');
+      if (name === 'get_balance') return String(r.text || 'no money recorded in this chat yet');
+      if (name === 'web_search' || name === 'fetch_page') return String(r.text || '').slice(0, 900) || 'nothing found';
+      if (name === 'remember_fact' || name === 'forget_fact') return String(r.summary || 'noted');
       if (name === 'mark_meetup') return 'noted';
       if (name === 'send_message') return r.as === 'voice note' ? `voice note sent to ${String(r.to || '')}`.trim() : `message sent to ${String(r.to || '')}`.trim();
     } catch { /* not JSON — keep looking */ }

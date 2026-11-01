@@ -99,6 +99,8 @@ export interface MsgContext {
   } | null;
   /** Set when the message (or the message it quotes) carries an image. */
   image?: { base64: string; mime: string } | null;
+  /** Framing note when the attached image is the chat's recent image the sender is referring to, not one sent with this message. */
+  imageNote?: string;
   /** True when this turn's text came from transcribing a voice note. */
   voiceNote?: boolean;
   /** True when an image was attached but could not be downloaded. */

@@ -8,12 +8,15 @@ import makeWASocket, {
 import pino from 'pino';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import QRCode from 'qrcode';
-import { writeFileSync, existsSync } from 'node:fs';
+import { writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { loadConfig, ROOT } from './config.js';
 import {
-  contactCount, getContact, getGroup, getKv, getMeetupGroupJid, getOwnerLid, setContact, setGroup, setKv, setOwnerLid,
+  claimOutbox, completeOutbox, contactCount, failOutbox, getContact, getGroup, getKv, getMeetupGroupJid,
+  getOwnerLid, pendingOutbox, pushHistory, recordSend, setContact, setGroup, setKv, setOwnerLid,
 } from './db.js';
+import { applyNameMentions, resolveSendTarget } from './actions.js';
 import { handleMessage } from './brain.js';
 import { synthesizeVoice } from './tts.js';
 import { extractQuoted, extractText, mentionedJidsOf, ownAudioNode, ownImageNode, unwrapMessage } from './message.js';
@@ -39,6 +42,12 @@ let botJid = '';
 let botLid = '';
 let pairingRequested = false;
 let isRegistered = false;
+
+// Per-chat most recent image (in-memory, 15 min): someone often drops a
+// screenshot without tagging the bot, then asks about it in a follow-up —
+// the cache is what lets that follow-up actually see the image.
+const RECENT_IMAGE_TTL_MS = 15 * 60 * 1000;
+const recentImages = new Map<string, { image: { base64: string; mime: string }; ts: number; from: string }>();
 
 function isMentioned(msg: AnyMsg): boolean {
   const m = unwrapMessage(msg.message);
@@ -69,7 +78,8 @@ async function sendOut(jid: string, payload: { text: string; voice: boolean }): 
       const ogg = await synthesizeVoice(payload.text);
       await sock.sendMessage(jid, { audio: ogg, ptt: true, mimetype: 'audio/ogg; codecs=opus' });
     } else {
-      await sock.sendMessage(jid, { text: payload.text });
+      const m = applyNameMentions(jid, payload.text);
+      await sock.sendMessage(jid, { text: m.text, ...(m.mentions.length ? { mentions: m.mentions } : {}) });
     }
     return { ok: true };
   } catch (e) {
@@ -184,6 +194,23 @@ async function onMessage(msg: AnyMsg): Promise<void> {
   const inMeetupGroup = cfg.meetup.enabled && Boolean(meetupJid) && meetupJid === jid;
   const meetupWord = /^(yes|yeah|yep|no|confirmed|done|met|we met|ok|okay|can'?t|cannot|not today)\b/i.test(raw);
 
+  // Cache this chat's latest image even when it doesn't address the bot,
+  // so a follow-up "check this" has something to look at. Allowed chats
+  // only — strangers' media is never downloaded.
+  const ownImg = ownImageNode(msg);
+  if (ownImg && isAllowed(cfg, { jid, isGroup, senderNumber, senderLid })) {
+    try {
+      const buf = await downloadMediaNode(ownImg.imageMessage, 'image');
+      recentImages.set(jid, {
+        image: { base64: buf.toString('base64'), mime: ownImg.imageMessage?.mimetype || 'image/jpeg' },
+        ts: Date.now(),
+        from: msg.pushName || 'someone',
+      });
+    } catch (e) {
+      console.error('recent-image cache failed:', (e as Error)?.message);
+    }
+  }
+
   const audioNode = ownAudioNode(msg);
   if (!audioNode && isGroup && !mentionsBot && !startsWithName && !quotedFromBot && !(inMeetupGroup && meetupWord)) return;
 
@@ -259,6 +286,7 @@ async function onMessage(msg: AnyMsg): Promise<void> {
   // except the brain is told (imageFailed), so it admits it can't see it
   // instead of hallucinating a description.
   let image: MsgContext['image'] = null;
+  let imageNote: string | undefined;
   let imageFailed = false;
   try {
     if (ownImageNode(msg)) {
@@ -275,12 +303,25 @@ async function onMessage(msg: AnyMsg): Promise<void> {
     imageFailed = Boolean(ownImageNode(msg) || quoted?.hasImage);
     console.error('media download failed:', (e as Error)?.message);
   }
+  if (!image && !imageFailed) {
+    // No image on this message — but if the sender is pointing at one
+    // ("check this", "what's this screenshot"), attach the chat's most
+    // recent image while it's still fresh.
+    const cached = recentImages.get(jid);
+    const refersToImage = !text.trim()
+      || /(screenshot|image|photo|picture|\bpic\b|\bss\b|check (this|it)|read (this|it)|what('s| is) this|describe|summari[sz]e this|explain this|translate this)/i.test(text);
+    if (cached && Date.now() - cached.ts < RECENT_IMAGE_TTL_MS && refersToImage) {
+      image = cached.image;
+      imageNote = `Attached is the most recent image posted in this chat (by ${cached.from}) — the sender is referring to it`;
+    }
+  }
 
   const ctx: MsgContext = {
     jid, isGroup, senderNumber, isOwner, groupContext,
     senderName: msg.pushName || '',
     quoted: quoted ? { text: quotedText, hasImage: quoted.hasImage, fromBot: quotedFromBot } : null,
     image,
+    imageNote,
     imageFailed,
     voiceNote,
     mentions,
@@ -305,7 +346,10 @@ async function onMessage(msg: AnyMsg): Promise<void> {
     setTimeout(() => { void claimAndRunDeferred(entry.id); }, delaySec * 1000);
   };
   const replies = await handleMessage(cfg, ctx, text, sendOut, defer);
-  for (const r of replies) await send(jid, r);
+  for (const r of replies) {
+    const m = applyNameMentions(jid, r);
+    await send(jid, m.text, m.mentions);
+  }
 }
 
 async function start(): Promise<void> {
@@ -418,12 +462,66 @@ async function start(): Promise<void> {
 
   sock.ev.on('messages.upsert', async ({ messages, type }: { messages: AnyMsg[]; type: string }) => {
     console.log(`upsert type=${type} count=${messages.length}`);
-    if (type !== 'notify') return;
-    for (const msg of messages) {
-      try { await onMessage(msg); } catch (e) { console.error('onMessage error', e); }
+    if (type === 'notify') {
+      for (const msg of messages) {
+        try { await onMessage(msg); } catch (e) { console.error('onMessage error', e); }
+      }
+      return;
+    }
+    if (type === 'append') {
+      // Messages that arrived while the bot was briefly disconnected are
+      // delivered as 'append' on reconnect and used to be dropped
+      // wholesale — whole questions vanished from her world without a
+      // trace (Ali's "what is the current balance", in production use). Only
+      // FRESH appends (<10 min old) are real misses; anything older is
+      // history sync and stays ignored.
+      const nowSec = Math.floor(Date.now() / 1000);
+      for (const msg of messages) {
+        const rawTs = msg.messageTimestamp as AnyMsg;
+        const ts = typeof rawTs === 'number' ? rawTs
+          : rawTs && typeof rawTs.toNumber === 'function' ? rawTs.toNumber()
+          : Number(rawTs?.low || 0);
+        if (!ts || nowSec - ts > 600) continue;
+        try { await onMessage(msg); } catch (e) { console.error('onMessage error', e); }
+      }
     }
   });
 }
+
+// MCP outbox drain: external assistants queue sends in the DB through the
+// Octopus MCP server (mcp/); only this process holds the WhatsApp socket,
+// so it performs each send here through the same path as send_message.
+// The kv heartbeat lets the MCP server report live connection status.
+/** One external send, performed exactly like the send_message tool. */
+async function performSend(target: string, text: string, voice: boolean): Promise<{ ok: boolean; to?: string; jid?: string; as?: string; error?: string }> {
+  const resolved = resolveSendTarget(cfg, target);
+  if (!resolved.ok) {
+    return { ok: false, error: resolved.candidates ? `${resolved.error} (candidates: ${resolved.candidates.join(', ')})` : resolved.error };
+  }
+  const res = await sendOut(resolved.jid, { text, voice });
+  if (!res.ok) return { ok: false, error: `send failed: ${res.error || 'unknown error'}` };
+  recordSend(resolved.jid, voice ? 'voice' : 'text', text);
+  pushHistory(resolved.jid, 'assistant', voice ? `[sent as a voice note] ${text}` : text);
+  return { ok: true, to: resolved.name, jid: resolved.jid, as: voice ? 'voice note' : 'text' };
+}
+
+async function processOutbox(): Promise<void> {
+  setKv('mcpStatus', { connected: Boolean(sock && botJid), botJid, ts: Date.now() });
+  if (!sock || !botJid) return;
+  for (const row of pendingOutbox(3)) {
+    if (!claimOutbox(row.id)) continue;
+    const out = await performSend(row.target, row.text, row.voice);
+    if (!out.ok) {
+      failOutbox(row.id, out.error || 'send failed');
+      continue;
+    }
+    completeOutbox(row.id, out.jid || '', out.to || '');
+    console.log(`mcp outbox #${row.id} sent to ${out.to} (${out.jid})`);
+  }
+}
+setInterval(() => {
+  processOutbox().catch((e) => console.error('outbox error', e));
+}, 1000);
 
 // ---------- deferred quota retries (persistent) ----------
 interface DeferredTurn {
@@ -448,7 +546,10 @@ async function claimAndRunDeferred(id: string): Promise<void> {
       deferredOnce: true,
     };
     const out = await handleMessage(cfg, retryCtx, entry.text, sendOut, undefined);
-    for (const r of out) await send(entry.jid, r);
+    for (const r of out) {
+      const m = applyNameMentions(entry.jid, r);
+      await send(entry.jid, m.text, m.mentions);
+    }
   } catch (e) {
     console.error('deferred retry failed', entry.jid, (e as Error)?.message);
   }
@@ -460,6 +561,43 @@ setInterval(() => {
     if (d.dueAt <= now) void claimAndRunDeferred(d.id);
   }
 }, 30000);
+
+// Direct low-latency send endpoint for the MCP server (localhost only):
+// a send is performed synchronously instead of waiting for the outbox
+// drain. The MCP server falls back to the queue whenever this endpoint
+// does not answer or the bot is disconnected. Auth is the shared MCP
+// token from mcp/.env; without that file the endpoint stays off.
+function loadMcpToken(): string {
+  try {
+    const m = /^MCP_TOKEN=(.+)$/m.exec(readFileSync(join(ROOT, 'mcp', '.env'), 'utf8'));
+    return m ? m[1].trim() : '';
+  } catch { return ''; }
+}
+const mcpToken = loadMcpToken();
+if (mcpToken) {
+  const directApi = createServer((req, res) => {
+    const sendJson = (code: number, obj: unknown): void => {
+      res.writeHead(code, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(obj));
+    };
+    if (req.url === '/health') { sendJson(200, { ok: true, service: 'octopus-direct' }); return; }
+    if (req.url !== '/send' || req.method !== 'POST') { sendJson(404, { ok: false, error: 'not found' }); return; }
+    if (req.headers.authorization !== `Bearer ${mcpToken}`) { sendJson(401, { ok: false, error: 'unauthorized' }); return; }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 100_000) req.destroy(); });
+    req.on('end', async () => {
+      let args: { target?: string; text?: string; voice?: boolean };
+      try { args = JSON.parse(body) as typeof args; } catch { sendJson(400, { ok: false, error: 'bad json' }); return; }
+      const target = String(args.target || '').trim();
+      const text = String(args.text || '').trim();
+      if (!target || !text) { sendJson(400, { ok: false, error: 'target and text are required' }); return; }
+      if (!sock || !botJid) { sendJson(503, { ok: false, error: 'not connected' }); return; }
+      sendJson(200, await performSend(target, text, args.voice === true));
+    });
+  });
+  directApi.on('error', (e) => console.error('direct send endpoint error:', (e as Error).message));
+  directApi.listen(8766, '127.0.0.1', () => console.log('octopus direct send endpoint on 127.0.0.1:8766'));
+}
 
 // Scheduler tick
 setInterval(async () => {

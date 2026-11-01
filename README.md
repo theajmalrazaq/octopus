@@ -95,12 +95,31 @@ To pick the meetup group, in that group the **owner** says:
 - **Per-chat isolation** — every chat is a separate world; nothing leaks
   between groups or DMs.
 - Runs 24/7 as a systemd service.
+- **Money ledger** — shared expenses and payments in a chat are recorded
+  as they're mentioned ("I paid 600 for sandwiches, split two ways");
+  balances are computed from the ledger, so "how much do I owe?" gets an
+  exact answer even weeks later.
+- **Remembered facts** — durable per-chat facts ("his exam is Monday")
+  the agent saves on request and recalls in every later conversation.
+- **Web search** — for current facts (news, prices, scores) the agent
+  searches the web and reads pages instead of guessing.
+- **Screenshot memory** — an image dropped in a chat without tagging the
+  agent is kept briefly, so a follow-up "check this" still sees it.
+- **Real @mentions in replies** — when a reply addresses a group member
+  by name, it becomes a real WhatsApp mention that actually pings them.
+- **Provider failover** — with a second API key (`LLM_API_KEY_2`), calls
+  walk a model-major chain across key×model quota pools; one exhausted
+  pool no longer takes the agent down.
+- **MCP server** — other AI assistants can send messages as the agent
+  and look up its contacts/groups through the MCP server in `mcp/`
+  (token-authenticated; see `mcp/README.md`).
 
 ## Environment variables (`.env`)
 
 | Variable | Required | Purpose |
 |---|---|---|
 | `LLM_API_KEY` | yes | Key for any OpenAI-compatible chat API (Groq by default). |
+| `LLM_API_KEY_2` | no | Optional second key (ideally a separate provider account/org). Enables the failover chain: when one key×model pool is exhausted, calls hop to the next instead of failing. |
 | `LLM_API_BASE` | no | API base URL (default `https://api.groq.com/openai/v1`). |
 | `LLM_MODEL` | no | Text model id (default `openai/gpt-oss-120b`). |
 | `VISION_MODEL` | no | Vision model for image turns (default `qwen/qwen3.8-27b`). |
@@ -126,7 +145,9 @@ To pick the meetup group, in that group the **owner** says:
 | `src/access.ts` | The allowlist logic (owner by number/LID; groups by JID) |
 | `src/llm.ts` | The AI brain: system prompt (facts + personality + your memories), tool-calling loop, token pacer, fail-fast + deferred retry |
 | `src/actions.ts` | The tools the model can call (reminders with real @mentions, meetup, owner messaging), executed against the DB |
-| `src/db.ts` | SQLite layer (`data/agent.db`): reminders, history, contacts, groups, key-values, sent-message outbox |
+| `src/db.ts` | SQLite layer (`data/agent.db`): reminders, history, contacts, groups, key-values, sent-message log, money ledger, remembered facts, MCP outbox |
+| `src/web.ts` | Web search (Bing, then DuckDuckGo) and page fetching for the brain |
+| `mcp/server.mjs` | MCP server: lets other assistants send as the agent (see `mcp/README.md`) |
 | `src/scheduler.ts` | The clock: fires due reminders (AI-composed, with real mention pings), triggers the meetup posts (the AI writes their words) |
 | `src/message.ts` | Baileys message helpers: unwrapping, quoted-reply extraction, mention/image/audio detection |
 | `src/mediadl.ts` | Proxy-aware media download + WhatsApp media decryption (Baileys' built-in download can't use the proxy agent) |
