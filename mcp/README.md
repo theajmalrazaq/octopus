@@ -49,11 +49,11 @@ message actually went out.
 
 It can also run over stdio: `node server.mjs --stdio`.
 
-## Exposure
+## Reaching it
 
-The server binds `0.0.0.0` by default so other machines on your network
-can reach it; the bearer token is the only gate, so treat it like a
-password. If the bot only serves assistants on the same machine, set
-`MCP_HOST=127.0.0.1`. Reaching it from outside your network (e.g. over a
-VPN or an SSH tunnel) is up to your own infrastructure — the token
-travels in the clear over plain HTTP, so tunnel it.
+Nothing else is required: any MCP client that can reach this machine
+can use it. Assistants on the same computer point at
+`http://localhost:8765/mcp`; on the same network, at the machine's LAN
+address. The bearer token is the only gate, so treat it like a
+password — and if only same-machine assistants use it, set
+`MCP_HOST=127.0.0.1` to keep it off the network entirely.
